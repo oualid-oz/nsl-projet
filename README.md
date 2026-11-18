@@ -20,6 +20,8 @@ L'objectif est de concevoir une architecture de données NoSQL (persistance poly
 |-----|---------|-------------|--------|
 | 1 | [lot1-catalogue-mongodb/](lot1-catalogue-mongodb/) | MongoDB | Catalogue produits : schémas variables, forte lecture |
 | 2 | [lot2-panier-sessions-redis/](lot2-panier-sessions-redis/) | Redis | Panier et sessions : latence sub-milliseconde, expiration |
+| 3 | [lot3-logs-analytics-cassandra/](lot3-logs-analytics-cassandra/) | Cassandra | Logs de navigation et historique de commandes : écritures massives, rétention longue |
+| 4 | [lot4-recommandations-neo4j/](lot4-recommandations-neo4j/) | Neo4j | Recommandations et compatibilités : parcours de relations |
 
 ## Exécution rapide
 
@@ -32,7 +34,18 @@ mongosh "mongodb://localhost:27017/ldlc" lot1-catalogue-mongodb/queries.js
 # Lot 2 — Redis
 grep -Ev '^\s*(#|$)' lot2-panier-sessions-redis/commands.redis | redis-cli
 redis-cli --eval lot2-panier-sessions-redis/cart_add.lua 'cart:{user:42}' , CPU-AMD-R7-7800X3D 2 10 2592000
+
+# Lot 3 — Cassandra
+cqlsh -f lot3-logs-analytics-cassandra/schema.cql
+cqlsh -f lot3-logs-analytics-cassandra/queries.cql
+
+# Lot 4 — Neo4j 5
+cypher-shell -u neo4j -p <mdp> -f lot4-recommandations-neo4j/01-schema.cypher
+cypher-shell -u neo4j -p <mdp> -f lot4-recommandations-neo4j/02-sample-data.cypher
+cypher-shell -u neo4j -p <mdp> -f lot4-recommandations-neo4j/queries.cypher
 ```
+
+Les identifiants sont communs à tous les lots : SKU du catalogue (`CPU-AMD-R7-7800X3D`…), clients `user:…`, numéros de commande `LD…`.
 
 ## Suite du document
 
