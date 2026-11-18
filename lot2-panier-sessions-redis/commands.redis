@@ -1,0 +1,266 @@
+# =============================================================================
+#  Refonte LDLC — Lot 2 : Panier et sessions (Redis)
+#  commands.redis — Conception des clés et commandes types
+#
+#  Exécution (les lignes « # » sont des commentaires, filtrés avant envoi) :
+#    grep -Ev '^\s*(#|$)' commands.redis | redis-cli
+# =============================================================================
+#
+#  Pourquoi Redis ?
+#  ----------------
+#  - Latence sub-milliseconde : données en mémoire, structures natives
+#    (HASH, LIST) manipulées côté serveur en O(1).
+#  - Expiration native (TTL) : un panier ou une session inactive disparaît
+#    seule, sans batch de purge.
+#  - Partagé entre tous les serveurs web : les frontaux deviennent sans état
+#    (stateless), pas besoin de « sticky sessions » sur le load balancer ;
+#    on peut ajouter/retirer des serveurs web pendant les pics (soldes,
+#    Black Friday) sans perdre les sessions.
+#  - Données éphémères et reconstructibles : la cohérence forte d'un SGBD
+#    n'est pas nécessaire ; la persistance AOF (appendfsync everysec) suffit
+#    à survivre à un redémarrage.
+#
+#  Conception des clés
+#  -------------------
+#    sess:{sid}               HASH   session web            TTL glissant 30 min
+#    user:sessions:{user:ID}  SET    sessions d'un client   TTL glissant 30 j
+#    cart:{owner}             HASH   sku -> quantité        TTL glissant 30 j (client) / 3 j (anonyme)
+#    recent:{owner}           LIST   derniers SKU consultés TTL glissant 30 j
+#    cache:product:<sku>      STRING JSON de la fiche       TTL fixe 1 h (+ aléa)
+#
+#    owner = « user:<id> » pour un client connecté,
+#            « anon:<sid> » pour un visiteur anonyme.
+#
+#  Hash tags (Redis Cluster)
+#  -------------------------
+#  En cluster, une clé est placée sur l'un des 16 384 slots selon le CRC16
+#  de son nom. Si le nom contient {…}, SEUL le contenu des accolades est
+#  haché. Ainsi cart:{user:42} et recent:{user:42} sont sur le MÊME slot,
+#  donc le même nœud : on peut les modifier dans une même transaction MULTI
+#  ou un même script Lua (sinon erreur CROSSSLOT).
+#  À l'inverse, cache:product:<sku> n'a volontairement PAS de hash tag : les
+#  27 000 fiches doivent se répartir uniformément sur tous les nœuds.
+#
+#  TTL glissants
+#  -------------
+#  Chaque accès (lecture ou écriture) relance un EXPIRE : la clé expire
+#  après une durée d'INACTIVITÉ, pas après une durée fixe depuis sa création.
+# =============================================================================
+
+#  Remise à zéro des seules clés de démonstration (pas de FLUSHDB, pour ne
+#  pas effacer d'autres données présentes sur l'instance).
+DEL sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} user:sessions:{user:42} cart:{user:42} cart:{anon:f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} recent:{user:42} lock:cache:product:GPU-ASUS-RTX4070S-12
+DEL cache:product:CPU-AMD-R7-7800X3D cache:product:RAM-CORSAIR-DDR5-32-6000 cache:product:GPU-ASUS-RTX4070S-12
+
+
+# =============================================================================
+#  1. SESSIONS — sess:{sid} (HASH)
+# =============================================================================
+#  Le sid est un identifiant aléatoire de 128 bits, stocké dans un cookie
+#  HttpOnly + Secure + SameSite=Lax. Un HASH permet de lire/modifier un seul
+#  champ sans désérialiser toute la session.
+
+# --- Création de la session (premier accès d'un visiteur anonyme) ---
+HSET sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} created_at 1763460000 last_seen 1763460000 user_id "" cart_owner anon:f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b ip 82.64.12.34 user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" csrf_token 9d1e8a7c6b5f4e3d lang fr
+EXPIRE sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} 1800
+
+# --- À CHAQUE requête HTTP (n'importe quel serveur web) : lecture + TTL glissant ---
+#  En pratique ces deux commandes sont envoyées en pipeline (un seul aller-retour).
+HGETALL sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b}
+HSET sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} last_seen 1763460420
+EXPIRE sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} 1800
+TTL sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b}
+
+# --- Connexion du client n°42 ---
+#  Sécurité : en production on régénère le sid à la connexion (protection
+#  contre la fixation de session) : création d'une nouvelle clé puis DEL de
+#  l'ancienne (pas de RENAME : en cluster les deux sid ne sont pas sur le
+#  même slot).
+HSET sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} user_id 42 cart_owner user:42 last_seen 1763460500
+EXPIRE sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} 1800
+
+#  Index des sessions d'un client : permet « me déconnecter de tous mes
+#  appareils » ou de couper toutes les sessions après un changement de mot de passe.
+SADD user:sessions:{user:42} f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b
+EXPIRE user:sessions:{user:42} 2592000
+SMEMBERS user:sessions:{user:42}
+
+# --- Lecture d'un seul champ (ex. middleware d'authentification) ---
+HGET sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} user_id
+
+
+# =============================================================================
+#  2. PANIER — cart:{owner} (HASH sku -> quantité)
+# =============================================================================
+#  Le panier ne stocke QUE les SKU et les quantités. Le prix, le nom, l'image
+#  et le stock sont relus au moment de l'affichage (cache:product:<sku> puis
+#  MongoDB) : un panier ne doit jamais afficher un prix périmé.
+#  Le prix n'est « figé » qu'à la création de la commande.
+
+# --- Panier d'un visiteur anonyme (TTL 3 jours d'inactivité) ---
+HSET cart:{anon:f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} CPU-AMD-R7-7800X3D 1
+EXPIRE cart:{anon:f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b} 259200
+
+# --- Ajout au panier d'un client connecté ---
+#  Version naïve : HINCRBY est atomique mais NE PLAFONNE PAS la quantité
+#  (un client pourrait commander 500 cartes graphiques en promotion) et ne
+#  relance pas le TTL dans la même opération.
+HINCRBY cart:{user:42} GPU-ASUS-RTX4070S-12 1
+EXPIRE cart:{user:42} 2592000
+
+#  Version retenue : script Lua cart_add.lua (atomique : lecture, plafond,
+#  écriture et EXPIRE sans qu'aucune autre commande ne s'intercale).
+#  Depuis le shell :
+#    redis-cli --eval cart_add.lua 'cart:{user:42}' , RAM-CORSAIR-DDR5-32-6000 2 10 2592000
+#  Depuis l'application : SCRIPT LOAD une fois au démarrage, puis
+#    EVALSHA <sha1> 1 cart:{user:42} RAM-CORSAIR-DDR5-32-6000 2 10 2592000
+
+# --- Autres articles (simulation de ce que fait le script) ---
+HSET cart:{user:42} RAM-CORSAIR-DDR5-32-6000 2 CM-ASUS-B650A-WIFI 1 BOI-FRACTAL-NORTH 1
+EXPIRE cart:{user:42} 2592000
+
+# --- Modification de quantité depuis la page panier (valeur absolue) ---
+HSET cart:{user:42} RAM-CORSAIR-DDR5-32-6000 1
+EXPIRE cart:{user:42} 2592000
+
+# --- Suppression d'un article ---
+HDEL cart:{user:42} BOI-FRACTAL-NORTH
+EXPIRE cart:{user:42} 2592000
+
+# --- Affichage du panier et pastille « nombre d'articles » du header ---
+HGETALL cart:{user:42}
+HLEN cart:{user:42}
+HEXISTS cart:{user:42} GPU-ASUS-RTX4070S-12
+
+# --- Fusion du panier anonyme dans le panier client, à la connexion ---
+#  cart:{anon:…} et cart:{user:42} n'ont pas le même hash tag : en cluster
+#  ils peuvent être sur deux nœuds différents, une opération atomique unique
+#  est donc impossible. L'application :
+#    1) lit le panier anonyme (HGETALL) ;
+#    2) ajoute chaque ligne au panier client via cart_add.lua (plafond respecté) ;
+#    3) supprime le panier anonyme.
+#  Rejouer l'opération après une panne ne pose pas de problème grave : au
+#  pire une quantité est augmentée deux fois, toujours dans la limite du plafond.
+HGETALL cart:{anon:f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b}
+#  (étape 2 simulée ici par HINCRBY ; en réel : cart_add.lua)
+HINCRBY cart:{user:42} CPU-AMD-R7-7800X3D 1
+EXPIRE cart:{user:42} 2592000
+DEL cart:{anon:f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b}
+
+# --- Commande validée : le panier est vidé ---
+#  (le contenu a été recopié, avec les prix du moment, dans la commande
+#   persistée par le lot « commandes »)
+#  DEL cart:{user:42}
+
+TTL cart:{user:42}
+
+
+# =============================================================================
+#  3. PRODUITS RÉCEMMENT CONSULTÉS — recent:{owner} (LIST)
+# =============================================================================
+#  Liste ordonnée du plus récent au plus ancien, sans doublon, limitée à 20.
+#  MULTI/EXEC garantit que les 4 commandes s'appliquent ensemble ; c'est
+#  possible en cluster car toutes portent sur la même clé.
+MULTI
+LREM recent:{user:42} 0 CPU-AMD-R7-7800X3D
+LPUSH recent:{user:42} CPU-AMD-R7-7800X3D
+LTRIM recent:{user:42} 0 19
+EXPIRE recent:{user:42} 2592000
+EXEC
+
+MULTI
+LREM recent:{user:42} 0 GPU-ASUS-RTX4070S-12
+LPUSH recent:{user:42} GPU-ASUS-RTX4070S-12
+LTRIM recent:{user:42} 0 19
+EXPIRE recent:{user:42} 2592000
+EXEC
+
+#  Le client revient sur le processeur : il remonte en tête, sans doublon.
+MULTI
+LREM recent:{user:42} 0 CPU-AMD-R7-7800X3D
+LPUSH recent:{user:42} CPU-AMD-R7-7800X3D
+LTRIM recent:{user:42} 0 19
+EXPIRE recent:{user:42} 2592000
+EXEC
+
+#  Bandeau « vous avez consulté » : les 10 derniers.
+LRANGE recent:{user:42} 0 9
+
+#  Bonus du hash tag : panier et historique du même client sont sur le même
+#  slot, on peut donc les lire dans une seule transaction.
+MULTI
+HGETALL cart:{user:42}
+LRANGE recent:{user:42} 0 9
+EXEC
+
+
+# =============================================================================
+#  4. CACHE DES FICHES PRODUITS — cache:product:<sku> (STRING JSON)
+# =============================================================================
+#  Pattern cache-aside :
+#    1) GET cache:product:<sku> ;
+#    2) si absent : lecture MongoDB (findOne par _id, voir lot 1, Q1) puis
+#       SET … EX ttl ;
+#    3) invalidation : à chaque modification du produit dans MongoDB, un
+#       consumer des Change Streams fait DEL cache:product:<sku>.
+#  Le TTL (1 h + aléa de 0 à 5 min) borne l'obsolescence si une invalidation
+#  est perdue, et l'aléa évite que toutes les clés expirent en même temps.
+#  Pas de hash tag : répartition uniforme sur le cluster.
+#  Le stock affiché ici est indicatif ; le stock réel est vérifié au paiement.
+
+SET cache:product:CPU-AMD-R7-7800X3D '{"_id":"CPU-AMD-R7-7800X3D","name":"AMD Ryzen 7 7800X3D (4.2 GHz / 5.0 GHz)","brand":{"_id":"amd","name":"AMD"},"price":{"amount":"389.95","currency":"EUR"},"stock":{"status":"en_stock"},"rating":{"average":4.5,"count":8},"image":"/img/produits/cpu-amd-r7-7800x3d/1.webp"}' EX 3742
+SET cache:product:RAM-CORSAIR-DDR5-32-6000 '{"_id":"RAM-CORSAIR-DDR5-32-6000","name":"Corsair Vengeance DDR5 32 Go (2 x 16 Go) 6000 MHz CL30","brand":{"_id":"corsair","name":"Corsair"},"price":{"amount":"129.95","currency":"EUR"},"stock":{"status":"en_stock"},"rating":{"average":4.67,"count":6},"image":"/img/produits/ram-corsair-ddr5-32-6000/1.webp"}' EX 3655
+SET cache:product:GPU-ASUS-RTX4070S-12 '{"_id":"GPU-ASUS-RTX4070S-12","name":"ASUS Dual GeForce RTX 4070 SUPER OC Edition 12 Go","brand":{"_id":"asus","name":"ASUS"},"price":{"amount":"629.95","currency":"EUR"},"stock":{"status":"en_stock"},"rating":{"average":4.5,"count":4},"image":"/img/produits/gpu-asus-rtx4070s-12/1.webp"}' EX 3811
+
+# --- Lecture (cache hit) ---
+GET cache:product:CPU-AMD-R7-7800X3D
+TTL cache:product:CPU-AMD-R7-7800X3D
+
+# --- Affichage du panier : récupération des fiches de tous ses articles ---
+#  Sur une instance unique, MGET en un aller-retour. En cluster, MGET sur des
+#  clés de slots différents échoue (CROSSSLOT) : le client Redis découpe
+#  alors la requête en GET pipelinés par nœud.
+MGET cache:product:CPU-AMD-R7-7800X3D cache:product:RAM-CORSAIR-DDR5-32-6000 cache:product:GPU-ASUS-RTX4070S-12
+
+# --- Invalidation après changement de prix dans MongoDB ---
+DEL cache:product:GPU-ASUS-RTX4070S-12
+EXISTS cache:product:GPU-ASUS-RTX4070S-12
+
+# --- Protection contre l'effet « thundering herd » (optionnel) ---
+#  Lors d'un cache miss sur un produit très demandé (lancement d'une carte
+#  graphique), un seul serveur reconstruit le cache : il prend un verrou
+#  court ; les autres attendent quelques ms puis relisent le cache.
+SET lock:cache:product:GPU-ASUS-RTX4070S-12 web-03 NX PX 2000
+
+
+# =============================================================================
+#  5. DÉCONNEXION
+# =============================================================================
+DEL sess:{f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b}
+SREM user:sessions:{user:42} f3a9c2e1b7d84e0c9a6b5d4c3e2f1a0b
+#  Le panier cart:{user:42} est CONSERVÉ : le client le retrouvera à sa
+#  prochaine connexion, sur n'importe quel appareil (dans la limite du TTL).
+EXISTS cart:{user:42}
+
+
+# =============================================================================
+#  6. EXPLOITATION — dimensionnement et configuration (commentaires)
+# =============================================================================
+#  Ordre de grandeur :
+#    - ~50 000 sessions actives simultanées en pic × ~0,5 Ko  ≈  25 Mo
+#    - ~300 000 paniers vivants × ~0,3 Ko                     ≈  90 Mo
+#    - 27 000 fiches en cache × ~2 Ko                         ≈  55 Mo
+#  Le volume est faible : le cluster sert surtout à la DISPONIBILITÉ
+#  (réplicas + basculement automatique) et au débit, pas à la capacité.
+#
+#  Deux usages, deux politiques mémoire :
+#    - sessions + paniers : instance/cluster dédié, maxmemory-policy
+#      noeviction (on ne veut JAMAIS perdre un panier pour faire de la
+#      place), persistance AOF appendfsync everysec ;
+#    - cache produits : instance séparée, maxmemory-policy allkeys-lru,
+#      sans persistance (le cache se reconstruit depuis MongoDB).
+#
+#  Sur une instance unique (TP), on peut s'en approcher avec volatile-lru,
+#  toutes les clés ayant un TTL.
+CONFIG GET maxmemory-policy
+INFO keyspace

@@ -1,0 +1,26 @@
+# Configuration locale de Claude Code
+.claude/
+
+# Éditeurs / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Systèmes d'exploitation
+.DS_Store
+Thumbs.db
+
+# Secrets et variables d'environnement
+.env
+.env.*
+
+# Dépendances et journaux
+node_modules/
+*.log
+
+# Données locales éventuelles (dumps MongoDB, persistance Redis)
+dump/
+*.rdb
+appendonly*.aof
+appendonlydir/
