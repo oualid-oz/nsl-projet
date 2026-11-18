@@ -1,0 +1,201 @@
+# =============================================================================
+#  Refonte LDLC — Bonus : prototype complet (4 bases + API FastAPI)
+#
+#  Démarrage :   docker compose up -d --build
+#  Démo :        ./api/demo.sh
+#  Arrêt :       docker compose down        (ajouter -v pour effacer les données)
+#
+#  Ports exposés sur l'hôte, surchargeables par variables d'environnement
+#  (ou fichier .env, voir .env.example), par exemple si un MongoDB local
+#  occupe déjà 27017 :
+#    MONGO_PORT=27018 docker compose up -d --build
+#
+#  Ordre de démarrage :
+#    mongo, redis, cassandra, neo4j          (healthchecks)
+#      → cassandra-init (lot3/schema.cql), neo4j-init (lot4/01 + 02)
+#        → seed (événements et commandes datés par rapport à aujourd'hui)
+#          → api
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  #  Lot 1 — Catalogue (MongoDB)
+  #  Les scripts du lot 1 sont exécutés par l'image officielle via
+  #  docker-entrypoint-initdb.d, dans l'ordre alphabétique, UNIQUEMENT au
+  #  premier démarrage (volume de données vide).
+  # ---------------------------------------------------------------------------
+  mongo:
+    image: mongo:8.0
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - ./lot1-catalogue-mongodb/01-schema.js:/docker-entrypoint-initdb.d/01-schema.js:ro
+      - ./lot1-catalogue-mongodb/02-sample-data.js:/docker-entrypoint-initdb.d/02-sample-data.js:ro
+      - mongo-data:/data/db
+    healthcheck:
+      # « sain » seulement quand le catalogue est chargé, pas dès que le port répond
+      test: ["CMD", "mongosh", "--quiet", "--eval",
+             "quit(db.getSiblingDB('ldlc').products.countDocuments() >= 14 ? 0 : 1)"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  #  Lot 2 — Paniers, sessions, cache (Redis)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec",
+              "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  #  Lot 3 — Logs, analytics, commandes (Cassandra)
+  # ---------------------------------------------------------------------------
+  cassandra:
+    image: cassandra:5.0
+    ports:
+      - "${CASSANDRA_PORT:-9042}:9042"
+    environment:
+      MAX_HEAP_SIZE: 1G
+      HEAP_NEWSIZE: 200M
+      CASSANDRA_DC: datacenter1
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT release_version FROM system.local' > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 40s
+
+  #  Conteneur d'initialisation : crée le keyspace et les tables du lot 3.
+  #  schema.cql n'utilise que des IF NOT EXISTS : rejouable sans risque.
+  #  (queries.cql n'est PAS rejoué : ses incréments de compteurs ne sont pas
+  #   idempotents ; c'est le seed qui fournit des données datées d'aujourd'hui.)
+  cassandra-init:
+    image: cassandra:5.0
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./lot3-logs-analytics-cassandra:/lot3:ro
+    entrypoint: ["cqlsh", "cassandra", "-f", "/lot3/schema.cql"]
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  #  Lot 4 — Recommandations (Neo4j)
+  # ---------------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-ldlc-password}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${NEO4J_AUTH#neo4j/}\" 'RETURN 1' > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  #  Conteneur d'initialisation : contraintes (toujours, idempotentes), puis
+  #  jeu de données du lot 4 SEULEMENT si le graphe est vide (02 commence
+  #  par un DETACH DELETE : le rejouer effacerait les achats du seed).
+  neo4j-init:
+    image: neo4j:5
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-ldlc-password}
+    volumes:
+      - ./lot4-recommandations-neo4j:/lot4:ro
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        CS="cypher-shell -a neo4j://neo4j:7687 -u neo4j -p $$NEO4J_PASSWORD"
+        $$CS -f /lot4/01-schema.cypher > /dev/null
+        N=$$($$CS --format plain 'MATCH (p:Product) RETURN count(p)' | tail -1)
+        if [ "$$N" = "0" ]; then
+          echo "Graphe vide : chargement de 02-sample-data.cypher"
+          $$CS -f /lot4/02-sample-data.cypher
+        else
+          echo "Graphe déjà initialisé ($$N produits) : rien à faire"
+        fi
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  #  Seed : événements de navigation et commandes datés par rapport à
+  #  aujourd'hui (Cassandra + Neo4j), top de la semaine, BOUGHT_WITH.
+  #  Ne s'exécute qu'une fois (marqueur dans Cassandra) ; forcer avec
+  #  docker compose run --rm seed python seed.py --force
+  # ---------------------------------------------------------------------------
+  seed:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: ["python", "seed.py"]
+    environment: &api-env
+      MONGO_URI: mongodb://mongo:27017
+      REDIS_HOST: redis
+      CASSANDRA_HOSTS: cassandra
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-ldlc-password}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      cassandra-init:
+        condition: service_completed_successfully
+      neo4j-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  #  API FastAPI — un router par lot. Documentation : http://localhost:8000/docs
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment: *api-env
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/sante', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+  redis-data:
+  cassandra-data:
+  neo4j-data:

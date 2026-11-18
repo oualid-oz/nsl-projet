@@ -1,6 +1,6 @@
 # Refonte LDLC — Architecture de données NoSQL
 
-**Auteur :** OUZANIK Oualid — projet réalisé seul
+**Auteur :** OUZANIK Oualid
 
 ---
 
@@ -46,6 +46,36 @@ cypher-shell -u neo4j -p <mdp> -f lot4-recommandations-neo4j/queries.cypher
 ```
 
 Les identifiants sont communs à tous les lots : SKU du catalogue (`CPU-AMD-R7-7800X3D`…), clients `user:…`, numéros de commande `LD…`.
+
+## Bonus — prototype d'API sur les 4 bases
+
+Un [docker-compose.yml](docker-compose.yml) démarre les quatre bases, les initialise avec les scripts des lots, génère des données datées par rapport au jour courant, puis lance une API FastAPI ([api/](api/)).
+
+```bash
+docker compose up -d --build        # ~2 min au premier démarrage (Cassandra)
+./api/demo.sh                       # scénario complet en curl
+# Documentation interactive : http://localhost:8000/docs
+```
+
+Les ports exposés se surchargent par variables (voir [.env.example](.env.example)), par exemple `MONGO_PORT=27018 docker compose up -d` si un MongoDB local occupe déjà 27017.
+
+| Service | Rôle |
+|---------|------|
+| `mongo` | charge `lot1/01-schema.js` et `02-sample-data.js` via `docker-entrypoint-initdb.d` |
+| `redis` | sessions, paniers, cache (AOF activé) |
+| `cassandra` + `cassandra-init` | `lot3/schema.cql` |
+| `neo4j` + `neo4j-init` | `lot4/01-schema.cypher`, puis `02-sample-data.cypher` si le graphe est vide |
+| `seed` | commandes sur 180 jours, compteurs sur 14 jours, événements bruts, top de la semaine, `BOUGHT_WITH` (une seule fois) |
+| `api` | FastAPI, un router par lot |
+
+| Router | Routes principales | Bases |
+|--------|--------------------|-------|
+| Lot 1 — catalogue | `GET /produits` (filtres `specs.*`, facettes, texte), `GET /produits/{sku}` (cache-aside, en-tête `X-Cache`), `POST /produits/{sku}/avis`, `PATCH /produits/{sku}/prix`, `GET /categories/{id}` | MongoDB, Redis |
+| Lot 2 — panier | `POST /sessions`, `POST /sessions/connexion` (fusion du panier), `POST /panier/articles` (script Lua), `PUT/DELETE /panier/articles/{sku}`, `GET /panier`, `GET /historique` | Redis |
+| Lot 3 — analytics | `POST /evenements`, `GET /analytics/produits/{sku}/vues`, `GET /analytics/top-semaine`, `POST /analytics/jobs/top-semaine`, `POST /commandes`, `GET /clients/{id}/commandes`, `PATCH /commandes/{id}/statut` | Cassandra, Neo4j, MongoDB |
+| Lot 4 — recommandations | `…/aussi-achetes`, `…/compatibles`, `…/similaires`, `/configurateur`, `/clients/{id}`, `…/entourage`, `POST /recommandations/jobs/bought-with` | Neo4j |
+
+La session se transmet par l'en-tête `X-Session-Id` (ou le cookie `sid`). La connexion est simulée (`{"customer_id": "user:42"}`, sans mot de passe).
 
 ## Suite du document
 
