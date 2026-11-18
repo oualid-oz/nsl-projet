@@ -263,6 +263,24 @@ Dans Neo4j, une relation est un pointeur physique entre deux nœuds (*index-free
 
 ### 4.2 Schéma
 
+```mermaid
+graph LR
+  Product -->|IN_CATEGORY| Category
+  Category -->|SUBCATEGORY_OF| Category
+  Product -->|MADE_BY| Brand
+  Product -->|PART_OF| Range
+  Range -->|OF_BRAND| Brand
+  Customer -->|BOUGHT| Product
+  Customer -->|VIEWED| Product
+  Customer -->|FRIEND_OF| Customer
+  Product -->|BOUGHT_WITH| Product
+  Product -->|HAS_SOCKET| Socket
+  Product -->|HAS_FORM_FACTOR| FormFactor
+  Product -->|SUPPORTS_MEMORY| MemoryType
+  Product -->|ACCEPTS_FORM_FACTOR| FormFactor
+  Product -->|HAS_MEMORY_TYPE| MemoryType
+```
+
 ```
 (:Product)-[:IN_CATEGORY]->(:Category)-[:SUBCATEGORY_OF]->(:Category)
 (:Product)-[:MADE_BY]->(:Brand)      (:Product)-[:PART_OF]->(:Range)-[:OF_BRAND]->(:Brand)
